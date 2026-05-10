@@ -1,5 +1,6 @@
 #include "../config.h"
 #include "wiiu.h"
+#include "overlay.h"
 
 #include <malloc.h>
 
@@ -35,6 +36,54 @@ static OSAlarm inputAlarm;
 
 // ~60 Hz
 #define INPUT_UPDATE_RATE OSMillisecondsToTicks(16)
+
+static uint32_t overlay_mask_from_vpad(uint32_t btns) {
+  uint32_t mask = 0;
+#define MAPBTN(v, f) if (btns & v) mask |= f;
+  MAPBTN(VPAD_BUTTON_A, OVERLAY_INPUT_A);
+  MAPBTN(VPAD_BUTTON_B, OVERLAY_INPUT_B);
+  MAPBTN(VPAD_BUTTON_UP, OVERLAY_INPUT_UP);
+  MAPBTN(VPAD_BUTTON_DOWN, OVERLAY_INPUT_DOWN);
+  MAPBTN(VPAD_BUTTON_LEFT, OVERLAY_INPUT_LEFT);
+  MAPBTN(VPAD_BUTTON_RIGHT, OVERLAY_INPUT_RIGHT);
+  MAPBTN(VPAD_BUTTON_ZL, OVERLAY_INPUT_LT);
+  MAPBTN(VPAD_BUTTON_ZR, OVERLAY_INPUT_RT);
+  MAPBTN(VPAD_BUTTON_PLUS, OVERLAY_INPUT_PLUS);
+#undef MAPBTN
+  return mask;
+}
+
+static uint32_t overlay_mask_from_pro(uint32_t btns) {
+  uint32_t mask = 0;
+#define MAPBTN(v, f) if (btns & v) mask |= f;
+  MAPBTN(WPAD_PRO_BUTTON_A, OVERLAY_INPUT_A);
+  MAPBTN(WPAD_PRO_BUTTON_B, OVERLAY_INPUT_B);
+  MAPBTN(WPAD_PRO_BUTTON_UP, OVERLAY_INPUT_UP);
+  MAPBTN(WPAD_PRO_BUTTON_DOWN, OVERLAY_INPUT_DOWN);
+  MAPBTN(WPAD_PRO_BUTTON_LEFT, OVERLAY_INPUT_LEFT);
+  MAPBTN(WPAD_PRO_BUTTON_RIGHT, OVERLAY_INPUT_RIGHT);
+  MAPBTN(WPAD_PRO_TRIGGER_ZL, OVERLAY_INPUT_LT);
+  MAPBTN(WPAD_PRO_TRIGGER_ZR, OVERLAY_INPUT_RT);
+  MAPBTN(WPAD_PRO_BUTTON_PLUS, OVERLAY_INPUT_PLUS);
+#undef MAPBTN
+  return mask;
+}
+
+static uint32_t overlay_mask_from_classic(uint32_t btns) {
+  uint32_t mask = 0;
+#define MAPBTN(v, f) if (btns & v) mask |= f;
+  MAPBTN(WPAD_CLASSIC_BUTTON_A, OVERLAY_INPUT_A);
+  MAPBTN(WPAD_CLASSIC_BUTTON_B, OVERLAY_INPUT_B);
+  MAPBTN(WPAD_CLASSIC_BUTTON_UP, OVERLAY_INPUT_UP);
+  MAPBTN(WPAD_CLASSIC_BUTTON_DOWN, OVERLAY_INPUT_DOWN);
+  MAPBTN(WPAD_CLASSIC_BUTTON_LEFT, OVERLAY_INPUT_LEFT);
+  MAPBTN(WPAD_CLASSIC_BUTTON_RIGHT, OVERLAY_INPUT_RIGHT);
+  MAPBTN(WPAD_CLASSIC_BUTTON_ZL, OVERLAY_INPUT_LT);
+  MAPBTN(WPAD_CLASSIC_BUTTON_ZR, OVERLAY_INPUT_RT);
+  MAPBTN(WPAD_CLASSIC_BUTTON_PLUS, OVERLAY_INPUT_PLUS);
+#undef MAPBTN
+  return mask;
+}
 
 void handleTouch(VPADTouchData touch) {
   if (mouse_mode == MOUSE_MODE_ABSOLUTE) {
@@ -122,9 +171,44 @@ void wiiu_input_update(void) {
   for (int i = 0; i < wiiu_input_num_controllers(); i++)
     gamepad_mask |= 1 << i;
 
-  VPADStatus vpad;
+  VPADStatus vpad = {0};
   VPADReadError err;
   VPADRead(VPAD_CHAN_0, &vpad, 1, &err);
+
+  KPADStatus kpad_data[4] = {0};
+  int32_t kpad_err[4] = {-1, -1, -1, -1};
+  for (int i = 0; i < 4; i++) {
+    KPADReadEx((KPADChan) i, &kpad_data[i], 1, &kpad_err[i]);
+  }
+
+  uint32_t overlayHeld = 0;
+  uint32_t overlayTriggered = 0;
+  if (err == VPAD_READ_SUCCESS) {
+    overlayHeld |= overlay_mask_from_vpad(vpad.hold);
+    overlayTriggered |= overlay_mask_from_vpad(vpad.trigger);
+  }
+
+  for (int i = 0; i < 4; i++) {
+    if (kpad_err[i] != KPAD_ERROR_OK) {
+      continue;
+    }
+
+    if (kpad_data[i].extensionType == WPAD_EXT_PRO_CONTROLLER) {
+      overlayHeld |= overlay_mask_from_pro(kpad_data[i].pro.hold);
+      overlayTriggered |= overlay_mask_from_pro(kpad_data[i].pro.trigger);
+    }
+    else if (kpad_data[i].extensionType == WPAD_EXT_CLASSIC || kpad_data[i].extensionType == WPAD_EXT_MPLUS_CLASSIC) {
+      overlayHeld |= overlay_mask_from_classic(kpad_data[i].classic.hold);
+      overlayTriggered |= overlay_mask_from_classic(kpad_data[i].classic.trigger);
+    }
+  }
+
+  if (Overlay_InputUpdate(overlayHeld, overlayTriggered)) {
+    touched = 0;
+    lastTouched = 0;
+    return;
+  }
+
   if (err == VPAD_READ_SUCCESS && !disable_gamepad) {
     uint32_t btns = vpad.hold;
     short buttonFlags = 0;
@@ -173,13 +257,10 @@ void wiiu_input_update(void) {
     handleTouch(touch);
   }
 
-  KPADStatus kpad_data = {0};
-	int32_t kpad_err = -1;
 	for (int i = 0; i < 4; i++) {
-		KPADReadEx((KPADChan) i, &kpad_data, 1, &kpad_err);
-		if (kpad_err == KPAD_ERROR_OK && controllerNumber < 4) {
-      if (kpad_data.extensionType == WPAD_EXT_PRO_CONTROLLER) {
-        uint32_t btns = kpad_data.pro.hold;
+		if (kpad_err[i] == KPAD_ERROR_OK && controllerNumber < 4) {
+      if (kpad_data[i].extensionType == WPAD_EXT_PRO_CONTROLLER) {
+        uint32_t btns = kpad_data[i].pro.hold;
         short buttonFlags = 0;
 #define CHECKBTN(v, f) if (btns & v) buttonFlags |= f;
         if (swap_buttons) {
@@ -208,7 +289,7 @@ void wiiu_input_update(void) {
 #undef CHECKBTN
 
         // If the button was just pressed, reset to current time
-        if (kpad_data.pro.trigger & WPAD_PRO_BUTTON_HOME)
+        if (kpad_data[i].pro.trigger & WPAD_PRO_BUTTON_HOME)
           home_pressed[controllerNumber] = millis();
 
         if (btns & WPAD_PRO_BUTTON_HOME && millis() - home_pressed[controllerNumber] > 3000) {
@@ -217,13 +298,13 @@ void wiiu_input_update(void) {
         }
 
         LiSendMultiControllerEvent(controllerNumber++, gamepad_mask, buttonFlags,
-          (kpad_data.pro.hold & WPAD_PRO_TRIGGER_ZL) ? 0xFF : 0,
-          (kpad_data.pro.hold & WPAD_PRO_TRIGGER_ZR) ? 0xFF : 0,
-          kpad_data.pro.leftStick.x * INT16_MAX, kpad_data.pro.leftStick.y * INT16_MAX,
-          kpad_data.pro.rightStick.x * INT16_MAX, kpad_data.pro.rightStick.y * INT16_MAX);
+          (kpad_data[i].pro.hold & WPAD_PRO_TRIGGER_ZL) ? 0xFF : 0,
+          (kpad_data[i].pro.hold & WPAD_PRO_TRIGGER_ZR) ? 0xFF : 0,
+          kpad_data[i].pro.leftStick.x * INT16_MAX, kpad_data[i].pro.leftStick.y * INT16_MAX,
+          kpad_data[i].pro.rightStick.x * INT16_MAX, kpad_data[i].pro.rightStick.y * INT16_MAX);
       }
-      else if (kpad_data.extensionType == WPAD_EXT_CLASSIC || kpad_data.extensionType == WPAD_EXT_MPLUS_CLASSIC) {
-        uint32_t btns = kpad_data.classic.hold;
+      else if (kpad_data[i].extensionType == WPAD_EXT_CLASSIC || kpad_data[i].extensionType == WPAD_EXT_MPLUS_CLASSIC) {
+        uint32_t btns = kpad_data[i].classic.hold;
         short buttonFlags = 0;
 #define CHECKBTN(v, f) if (btns & v) buttonFlags |= f;
         if (swap_buttons) {
@@ -253,7 +334,7 @@ void wiiu_input_update(void) {
 #undef CHECKBTN
 
         // If the button was just pressed, reset to current time
-        if (kpad_data.classic.trigger & WPAD_CLASSIC_BUTTON_HOME)
+        if (kpad_data[i].classic.trigger & WPAD_CLASSIC_BUTTON_HOME)
           home_pressed[controllerNumber] = millis();
 
         if (btns & WPAD_CLASSIC_BUTTON_HOME && millis() - home_pressed[controllerNumber] > 3000) {
@@ -262,10 +343,10 @@ void wiiu_input_update(void) {
         }
 
         LiSendMultiControllerEvent(controllerNumber++, gamepad_mask, buttonFlags,
-          (kpad_data.classic.hold & WPAD_CLASSIC_BUTTON_ZL) ? 0xFF : 0x00,
-          (kpad_data.classic.hold & WPAD_CLASSIC_BUTTON_ZR) ? 0xFF : 0x00,
-          kpad_data.classic.leftStick.x * INT16_MAX, kpad_data.classic.leftStick.y * INT16_MAX,
-          kpad_data.classic.rightStick.x * INT16_MAX, kpad_data.classic.rightStick.y * INT16_MAX);
+          (kpad_data[i].classic.hold & WPAD_CLASSIC_BUTTON_ZL) ? 0xFF : 0x00,
+          (kpad_data[i].classic.hold & WPAD_CLASSIC_BUTTON_ZR) ? 0xFF : 0x00,
+          kpad_data[i].classic.leftStick.x * INT16_MAX, kpad_data[i].classic.leftStick.y * INT16_MAX,
+          kpad_data[i].classic.rightStick.x * INT16_MAX, kpad_data[i].classic.rightStick.y * INT16_MAX);
       }
     }
   }

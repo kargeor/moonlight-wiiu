@@ -13,11 +13,13 @@
 #include <gx2/registers.h>
 
 #include "shaders/display.h"
+#include "overlay.h"
 
 #define ATTRIB_SIZE (8 * 2 * sizeof(float))
 #define ATTRIB_STRIDE (4 * sizeof(float))
 
-static GX2Sampler screenSamp;
+static GX2Sampler tvScreenSamp;
+static GX2Sampler drcScreenSamp;
 static WHBGfxShaderGroup shaderGroup;
 
 static float* tvAttribs;
@@ -28,18 +30,101 @@ static float drcScreenSize[2];
 
 uint32_t currentFrame;
 uint32_t nextFrame;
+static uint32_t skippedFrames;
 
 static OSFastMutex queueMutex;
 static yuv_texture_t* queueMessages[MAX_QUEUEMESSAGES];
 static uint32_t queueWriteIndex;
 static uint32_t queueReadIndex;
+static uint32_t tvFilterMode = WIIU_STREAM_FILTER_POINT;
+static uint32_t drcFilterMode = WIIU_STREAM_FILTER_POINT;
+static uint32_t appliedTvFilterMode = WIIU_STREAM_FILTER_POINT;
+static uint32_t appliedDrcFilterMode = WIIU_STREAM_FILTER_POINT;
+static bool tvFilterDirty;
+static bool drcFilterDirty;
 
-void wiiu_stream_init(uint32_t width, uint32_t height)
+static uint32_t gx2_filter_mode(uint32_t filterMode)
+{
+  switch (filterMode) {
+    case WIIU_STREAM_FILTER_LINEAR:
+      return GX2_TEX_XY_FILTER_MODE_LINEAR;
+    case WIIU_STREAM_FILTER_BICUBIC:
+      return GX2_TEX_XY_FILTER_MODE_BICUBIC;
+    case WIIU_STREAM_FILTER_POINT:
+    default:
+      return GX2_TEX_XY_FILTER_MODE_POINT;
+  }
+}
+
+static void init_sampler(GX2Sampler* sampler, uint32_t filterMode)
+{
+  GX2InitSampler(sampler, GX2_TEX_CLAMP_MODE_WRAP, gx2_filter_mode(filterMode));
+}
+
+uint32_t wiiu_stream_get_tv_filter_mode(void)
+{
+  return tvFilterMode;
+}
+
+void wiiu_stream_set_tv_filter_mode(uint32_t mode)
+{
+  if (mode > WIIU_STREAM_TV_OFF) {
+    return;
+  }
+
+  tvFilterMode = mode;
+  tvFilterDirty = true;
+}
+
+uint32_t wiiu_stream_get_drc_filter_mode(void)
+{
+  return drcFilterMode;
+}
+
+void wiiu_stream_set_drc_filter_mode(uint32_t mode)
+{
+  if (mode > WIIU_STREAM_FILTER_BICUBIC) {
+    return;
+  }
+
+  drcFilterMode = mode;
+  drcFilterDirty = true;
+}
+
+static void apply_sampler_updates(void)
+{
+  if (tvFilterDirty) {
+    if (tvFilterMode != WIIU_STREAM_TV_OFF) {
+      init_sampler(&tvScreenSamp, tvFilterMode);
+    }
+    appliedTvFilterMode = tvFilterMode;
+    tvFilterDirty = false;
+  }
+
+  if (drcFilterDirty) {
+    init_sampler(&drcScreenSamp, drcFilterMode);
+    appliedDrcFilterMode = drcFilterMode;
+    drcFilterDirty = false;
+  }
+}
+
+static uint32_t get_queue_depth(void)
+{
+  OSFastMutex_Lock(&queueMutex);
+  uint32_t elements_in = queueWriteIndex - queueReadIndex;
+  OSFastMutex_Unlock(&queueMutex);
+  return elements_in;
+}
+
+void wiiu_stream_init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate)
 {
   currentFrame = nextFrame = 0;
+  skippedFrames = 0;
 
   OSFastMutex_Init(&queueMutex, "");
   queueReadIndex = queueWriteIndex = 0;
+  Overlay_Init();
+  Overlay_SetStreamConfig(width, height, fps, bitrate);
 
   if (!WHBGfxLoadGFDShaderGroup(&shaderGroup, 0, display_gsh)) {
     printf("Cannot load shader\n");
@@ -52,7 +137,8 @@ void wiiu_stream_init(uint32_t width, uint32_t height)
     printf("cannot init shader\n");
   }
 
-  GX2InitSampler(&screenSamp, GX2_TEX_CLAMP_MODE_WRAP, GX2_TEX_XY_FILTER_MODE_POINT);
+  init_sampler(&tvScreenSamp, appliedTvFilterMode);
+  init_sampler(&drcScreenSamp, appliedDrcFilterMode);
 
   GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
   tvScreenSize[0] = 1.0f / (float) cb->surface.width;
@@ -100,29 +186,37 @@ void wiiu_stream_draw(void)
   yuv_texture_t* tex = get_frame();
   if (tex) {
     if (++currentFrame <= nextFrame - NUM_BUFFERS) {
+      skippedFrames++;
       // display thread is behind decoder, skip frame
     }
     else {
+      Overlay_SetFrameStats(nextFrame, currentFrame - skippedFrames, skippedFrames, get_queue_depth());
+      Overlay_Prepare();
+      apply_sampler_updates();
+
       WHBGfxBeginRender();
 
-      // TV
-      WHBGfxBeginRenderTV();
-      WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+      if (tvFilterMode != WIIU_STREAM_TV_OFF) {
+        // TV
+        WHBGfxBeginRenderTV();
+        WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
-      GX2SetPixelTexture(&tex->yTex, 0);
-      GX2SetPixelTexture(&tex->uvTex, 1);
-      GX2SetPixelSampler(&screenSamp, 0);
-      GX2SetPixelSampler(&screenSamp, 1);
+        GX2SetPixelTexture(&tex->yTex, 0);
+        GX2SetPixelTexture(&tex->uvTex, 1);
+        GX2SetPixelSampler(&tvScreenSamp, 0);
+        GX2SetPixelSampler(&tvScreenSamp, 1);
 
-      GX2SetFetchShader(&shaderGroup.fetchShader);
-      GX2SetVertexShader(shaderGroup.vertexShader);
-      GX2SetPixelShader(shaderGroup.pixelShader);
+        GX2SetFetchShader(&shaderGroup.fetchShader);
+        GX2SetVertexShader(shaderGroup.vertexShader);
+        GX2SetPixelShader(shaderGroup.pixelShader);
 
-      GX2SetVertexUniformReg(0, 2, tvScreenSize);
-      GX2SetAttribBuffer(0, ATTRIB_SIZE, ATTRIB_STRIDE, tvAttribs);
-      GX2DrawEx(GX2_PRIMITIVE_MODE_QUADS, 4, 0, 1);
+        GX2SetVertexUniformReg(0, 2, tvScreenSize);
+        GX2SetAttribBuffer(0, ATTRIB_SIZE, ATTRIB_STRIDE, tvAttribs);
+        GX2DrawEx(GX2_PRIMITIVE_MODE_QUADS, 4, 0, 1);
+        Overlay_Draw();
 
-      WHBGfxFinishRenderTV();
+        WHBGfxFinishRenderTV();
+      }
 
       // DRC
       WHBGfxBeginRenderDRC();
@@ -130,8 +224,8 @@ void wiiu_stream_draw(void)
 
       GX2SetPixelTexture(&tex->yTex, 0);
       GX2SetPixelTexture(&tex->uvTex, 1);
-      GX2SetPixelSampler(&screenSamp, 0);
-      GX2SetPixelSampler(&screenSamp, 1);
+      GX2SetPixelSampler(&drcScreenSamp, 0);
+      GX2SetPixelSampler(&drcScreenSamp, 1);
 
       GX2SetFetchShader(&shaderGroup.fetchShader);
       GX2SetVertexShader(shaderGroup.vertexShader);
@@ -140,6 +234,7 @@ void wiiu_stream_draw(void)
       GX2SetVertexUniformReg(0, 2, drcScreenSize);
       GX2SetAttribBuffer(0, ATTRIB_SIZE, ATTRIB_STRIDE, drcAttribs);
       GX2DrawEx(GX2_PRIMITIVE_MODE_QUADS, 4, 0, 1);
+      Overlay_Draw();
       
       WHBGfxFinishRenderDRC();
 

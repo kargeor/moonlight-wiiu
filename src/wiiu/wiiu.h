@@ -30,10 +30,21 @@ extern char message_buffer[1024];
 
 #define FRAME_BUFFER 12
 
-void wiiu_stream_init(uint32_t width, uint32_t height);
+enum {
+  WIIU_STREAM_FILTER_POINT = 0,
+  WIIU_STREAM_FILTER_LINEAR = 1,
+  WIIU_STREAM_FILTER_BICUBIC = 2,
+  WIIU_STREAM_TV_OFF = 3,
+};
+
+void wiiu_stream_init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate);
 void wiiu_stream_draw(void);
 void wiiu_stream_fini(void);
 void wiiu_setup_renderstate(void);
+uint32_t wiiu_stream_get_tv_filter_mode(void);
+void wiiu_stream_set_tv_filter_mode(uint32_t mode);
+uint32_t wiiu_stream_get_drc_filter_mode(void);
+void wiiu_stream_set_drc_filter_mode(uint32_t mode);
 
 #define NUM_BUFFERS 2
 #define MAX_QUEUEMESSAGES 16

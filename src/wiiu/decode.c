@@ -1,4 +1,5 @@
 #include "wiiu.h"
+#include "overlay.h"
 
 #include <sps.h>
 
@@ -164,6 +165,23 @@ static int wiiu_decoder_submit_decode_unit(PDECODE_UNIT decodeUnit) {
     fprintf(stderr, "Video decode buffer too small\n");
     return DR_OK;
   }
+
+  uint64_t now = LiGetMillis();
+  uint32_t receiveLatencyMs = 0;
+  uint32_t decoderQueueMs = 0;
+  if (decodeUnit->enqueueTimeMs >= decodeUnit->receiveTimeMs) {
+    receiveLatencyMs = decodeUnit->enqueueTimeMs - decodeUnit->receiveTimeMs;
+  }
+  if (now >= decodeUnit->enqueueTimeMs) {
+    decoderQueueMs = now - decodeUnit->enqueueTimeMs;
+  }
+
+  Overlay_SetVideoStats(decodeUnit->frameNumber,
+                        decodeUnit->fullLength,
+                        decodeUnit->frameType == FRAME_TYPE_IDR,
+                        decodeUnit->frameHostProcessingLatency,
+                        receiveLatencyMs,
+                        decoderQueueMs);
 
   PLENTRY entry = decodeUnit->bufferList;
   int length = 0;

@@ -25,6 +25,7 @@
 
 #ifdef __WIIU__
 #include "wiiu/wiiu.h"
+#include "wiiu/overlay.h"
 #endif
 
 #ifdef HAVE_SDL
@@ -121,6 +122,10 @@ static void set_controller_led(unsigned short controllerNumber, unsigned char r,
 }
 
 static void connection_status_update(int status) {
+#ifdef __WIIU__
+  Overlay_SetConnectionStatus(status);
+#endif
+
   switch (status) {
     case CONN_STATUS_OKAY:
       printf("Connection is okay\n");

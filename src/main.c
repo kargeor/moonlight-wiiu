@@ -168,7 +168,7 @@ int main(int argc, char* argv[]) {
     state = STATE_CONNECTING;
   }
 
-  wiiu_stream_init(config.stream.width, config.stream.height);
+  wiiu_stream_init(config.stream.width, config.stream.height, config.stream.fps, config.stream.bitrate);
 
   GS_CLIENT client = gs_new(config.key_dir);
   if (client == NULL && gs_get_error(NULL) == GS_BAD_CONF) {
