@@ -20,7 +20,9 @@ typedef struct {
 static bool visible;
 static bool toggleComboHeld;
 static bool releaseCapture;
+static bool textureDirty;
 static uint32_t selectedItem;
+static uint64_t lastPrepareTime;
 
 static uint32_t streamWidth;
 static uint32_t streamHeight;
@@ -30,6 +32,11 @@ static uint32_t streamBitrate;
 static uint32_t decodedFrames;
 static uint32_t displayedFrames;
 static uint32_t skippedFrames;
+static uint32_t droppedFrames;
+static uint32_t decodedFps;
+static uint32_t displayedFps;
+static uint32_t skippedFps;
+static uint32_t droppedFps;
 static uint32_t queuedFrames;
 static uint32_t frameNumber;
 static uint32_t frameBytes;
@@ -39,13 +46,25 @@ static uint32_t receiveLatencyMs;
 static uint32_t decoderQueueMs;
 static int connectionStatus = CONN_STATUS_OKAY;
 
+#define OVERLAY_REFRESH_MS 1000
+
 static void close_overlay(void) {
   visible = false;
   selectedItem = 0;
 }
 
+static void exit_app(void) {
+  visible = false;
+  wiiu_proc_request_exit();
+  state = STATE_STOP_STREAM;
+}
+
 static void write_resume(char* buffer, size_t size) {
   snprintf(buffer, size, "Close overlay");
+}
+
+static void write_exit(char* buffer, size_t size) {
+  snprintf(buffer, size, "Close app");
 }
 
 static void write_connection(char* buffer, size_t size) {
@@ -75,8 +94,6 @@ static const char* filter_name(uint32_t mode) {
       return "Point";
     case WIIU_STREAM_FILTER_LINEAR:
       return "Linear";
-    case WIIU_STREAM_FILTER_BICUBIC:
-      return "Bicubic";
     case WIIU_STREAM_TV_OFF:
       return "Off";
   }
@@ -93,7 +110,19 @@ static void write_drc_filter(char* buffer, size_t size) {
 }
 
 static void write_frames(char* buffer, size_t size) {
-  snprintf(buffer, size, "decoded %u, displayed %u, skipped %u", decodedFrames, displayedFrames, skippedFrames);
+  uint32_t skippedPercent = decodedFps ? (skippedFps * 100) / decodedFps : 0;
+  uint32_t droppedPercent = decodedFps ? (droppedFps * 100) / decodedFps : 0;
+  uint32_t lostPercent = decodedFps ? ((skippedFps + droppedFps) * 100) / decodedFps : 0;
+  snprintf(buffer, size, "fps in %u, out %u, skip %u%%, drop %u%%, lost %u%%",
+           decodedFps, displayedFps, skippedPercent, droppedPercent, lostPercent);
+}
+
+static void write_frame_totals(char* buffer, size_t size) {
+  uint32_t skippedPercent = decodedFrames ? (skippedFrames * 100) / decodedFrames : 0;
+  uint32_t droppedPercent = decodedFrames ? (droppedFrames * 100) / decodedFrames : 0;
+  uint32_t lostPercent = decodedFrames ? ((skippedFrames + droppedFrames) * 100) / decodedFrames : 0;
+  snprintf(buffer, size, "decoded %u, displayed %u, skipped %u%%, dropped %u%%, lost %u%%",
+           decodedFrames, displayedFrames, skippedPercent, droppedPercent, lostPercent);
 }
 
 static void write_queue(char* buffer, size_t size) {
@@ -145,7 +174,7 @@ static void adjust_tv_filter(int delta) {
 }
 
 static void adjust_drc_filter(int delta) {
-  wiiu_stream_set_drc_filter_mode(cycle_value(wiiu_stream_get_drc_filter_mode(), WIIU_STREAM_FILTER_BICUBIC + 1, delta));
+  wiiu_stream_set_drc_filter_mode(cycle_value(wiiu_stream_get_drc_filter_mode(), WIIU_STREAM_FILTER_LINEAR + 1, delta));
 }
 
 static void next_tv_filter(void) {
@@ -166,8 +195,10 @@ static const OverlayMenuItem menuItems[] = {
   { "Host frame", write_host,       NULL,             NULL },
   { "Last frame", write_frame,      NULL,             NULL },
   { "Frames",     write_frames,     NULL,             NULL },
+  { "Totals",     write_frame_totals, NULL,           NULL },
   { "Queue",      write_queue,      NULL,             NULL },
   { "Input",      write_input,      NULL,             NULL },
+  { "Exit",       write_exit,       exit_app,        NULL },
 };
 
 #define MENU_ITEM_COUNT (sizeof(menuItems) / sizeof(menuItems[0]))
@@ -176,11 +207,9 @@ void Overlay_Init(void) {
   visible = false;
   toggleComboHeld = false;
   releaseCapture = false;
+  textureDirty = true;
   selectedItem = 0;
-}
-
-void Overlay_Reset(void) {
-  Overlay_Init();
+  lastPrepareTime = 0;
 }
 
 void Overlay_SetStreamConfig(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate) {
@@ -190,10 +219,17 @@ void Overlay_SetStreamConfig(uint32_t width, uint32_t height, uint32_t fps, uint
   streamBitrate = bitrate;
 }
 
-void Overlay_SetFrameStats(uint32_t decoded, uint32_t displayed, uint32_t skipped, uint32_t queued) {
+void Overlay_SetFrameStats(uint32_t decoded, uint32_t displayed, uint32_t skipped, uint32_t dropped,
+                           uint32_t decodedRate, uint32_t displayedRate, uint32_t skippedRate, uint32_t droppedRate,
+                           uint32_t queued) {
   decodedFrames = decoded;
   displayedFrames = displayed;
   skippedFrames = skipped;
+  droppedFrames = dropped;
+  decodedFps = decodedRate;
+  displayedFps = displayedRate;
+  skippedFps = skippedRate;
+  droppedFps = droppedRate;
   queuedFrames = queued;
 }
 
@@ -229,6 +265,7 @@ bool Overlay_InputUpdate(uint32_t held, uint32_t triggered) {
   if (toggled) {
     visible = !visible;
     selectedItem = 0;
+    textureDirty = true;
     if (!visible) {
       releaseCapture = true;
     }
@@ -241,33 +278,35 @@ bool Overlay_InputUpdate(uint32_t held, uint32_t triggered) {
 
   if (triggered & OVERLAY_INPUT_UP) {
     selectedItem = selectedItem == 0 ? MENU_ITEM_COUNT - 1 : selectedItem - 1;
+    textureDirty = true;
   }
   else if (triggered & OVERLAY_INPUT_DOWN) {
     selectedItem = (selectedItem + 1) % MENU_ITEM_COUNT;
+    textureDirty = true;
   }
 
   if ((triggered & OVERLAY_INPUT_A) && menuItems[selectedItem].action) {
     menuItems[selectedItem].action();
+    textureDirty = true;
     if (!visible) {
       releaseCapture = true;
     }
   }
   else if ((triggered & OVERLAY_INPUT_LEFT) && menuItems[selectedItem].adjust) {
     menuItems[selectedItem].adjust(-1);
+    textureDirty = true;
   }
   else if ((triggered & OVERLAY_INPUT_RIGHT) && menuItems[selectedItem].adjust) {
     menuItems[selectedItem].adjust(1);
+    textureDirty = true;
   }
   else if (triggered & OVERLAY_INPUT_B) {
     close_overlay();
     releaseCapture = true;
+    textureDirty = true;
   }
 
   return true;
-}
-
-bool Overlay_IsVisible(void) {
-  return visible;
 }
 
 void Overlay_Prepare(void) {
@@ -275,16 +314,27 @@ void Overlay_Prepare(void) {
     return;
   }
 
+  uint64_t now = LiGetMillis();
+  if (!textureDirty && now - lastPrepareTime < OVERLAY_REFRESH_MS) {
+    return;
+  }
+
+  Font_SetVirtualSize(FONT_BUFFER_WIDTH, FONT_BUFFER_HEIGHT);
   Font_Clear();
-  Font_SetSize(42);
-  Font_SetColor(255, 255, 255, 230);
-  Font_Print(52, 70, "Moonlight Wii U");
 
-  Font_SetSize(26);
-  Font_SetColor(190, 220, 255, 210);
-  Font_Print(54, 118, "Overlay menu");
+  uint32_t panelHeight = 105 + MENU_ITEM_COUNT * 24;
+  Font_FillRect(10, 12, 834, panelHeight, 0, 0, 0, 255);
 
-  uint32_t y = 180;
+  Font_SetSize(24);
+  Font_SetColor(255, 255, 255, 255);
+  Font_Print(22, 34, "Moonlight Wii U");
+
+  Font_SetSize(15);
+  Font_SetColor(205, 230, 255, 240);
+  Font_Print(23, 58, "Overlay menu");
+
+  Font_SetSize(15);
+  uint32_t y = 86;
   for (uint32_t i = 0; i < MENU_ITEM_COUNT; i++) {
     char value[128];
     value[0] = '\0';
@@ -293,22 +343,26 @@ void Overlay_Prepare(void) {
     }
 
     if (i == selectedItem) {
-      Font_SetColor(115, 255, 180, 245);
-      Font_Printf(54, y, "> %s", menuItems[i].label);
+      Font_SetColor(125, 255, 190, 255);
+      Font_Printf(23, y, "> %s", menuItems[i].label);
     }
     else {
-      Font_SetColor(255, 255, 255, 220);
-      Font_Printf(54, y, "  %s", menuItems[i].label);
+      Font_SetColor(255, 255, 255, 240);
+      Font_Printf(23, y, "  %s", menuItems[i].label);
     }
 
-    Font_SetColor(220, 220, 220, 210);
-    Font_Printf(410, y, "%s", value);
-    y += 42;
+    Font_SetColor(235, 235, 235, 235);
+    Font_Printf(190, y, "%s", value);
+    y += 24;
   }
 
-  Font_SetSize(24);
-  Font_SetColor(200, 200, 200, 190);
-  Font_Print(54, y + 30, "A selects/cycles, Left/Right adjusts, B closes. Host input is captured while visible.");
+  Font_SetSize(13);
+  Font_SetColor(215, 215, 215, 235);
+  Font_Print(23, y + 18, "A selects/cycles, Left/Right adjusts, B closes. Host input is captured while visible.");
+
+  textureDirty = false;
+  lastPrepareTime = now;
+  Font_SetVirtualSize(FONT_DEFAULT_VIRTUAL_WIDTH, FONT_DEFAULT_VIRTUAL_HEIGHT);
 }
 
 void Overlay_Draw(void) {

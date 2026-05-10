@@ -33,8 +33,7 @@ extern char message_buffer[1024];
 enum {
   WIIU_STREAM_FILTER_POINT = 0,
   WIIU_STREAM_FILTER_LINEAR = 1,
-  WIIU_STREAM_FILTER_BICUBIC = 2,
-  WIIU_STREAM_TV_OFF = 3,
+  WIIU_STREAM_TV_OFF = 2,
 };
 
 void wiiu_stream_init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate);
@@ -54,7 +53,6 @@ typedef struct {
   GX2Texture uvTex;
 } yuv_texture_t;
 
-void* get_frame(void);
 void add_frame(yuv_texture_t* msg);
 
 extern uint32_t nextFrame;
@@ -76,6 +74,7 @@ void wiiu_proc_shutdown(void);
 void wiiu_proc_register_home_callback(void);
 int wiiu_proc_running(void);
 void wiiu_proc_stop_running(void);
+void wiiu_proc_request_exit(void);
 void wiiu_proc_set_home_enabled(int enabled);
 
 // net

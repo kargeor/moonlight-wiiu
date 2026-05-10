@@ -23,6 +23,9 @@ static FT_Library ft_lib = NULL;
 static FT_Face ft_face   = NULL;
 
 static uint8_t font_r = 255, font_g = 255, font_b = 255, font_a = 255;
+static uint32_t fontVirtualWidth = FONT_DEFAULT_VIRTUAL_WIDTH;
+static uint32_t fontVirtualHeight = FONT_DEFAULT_VIRTUAL_HEIGHT;
+static uint32_t fontSize = 0;
 
 static const float font_vertex_buffer[] __attribute__ ((aligned (GX2_VERTEX_BUFFER_ALIGNMENT))) = {
    -1.0f, -1.0f,  0.0f, 1.0f,
@@ -30,6 +33,29 @@ static const float font_vertex_buffer[] __attribute__ ((aligned (GX2_VERTEX_BUFF
     1.0f,  1.0f,  1.0f, 0.0f,
    -1.0f,  1.0f,  0.0f, 0.0f,
 };
+
+static uint32_t scale_x(uint32_t value)
+{
+    return ((uint64_t) value * FONT_BUFFER_WIDTH) / fontVirtualWidth;
+}
+
+static uint32_t scale_y(uint32_t value)
+{
+    return ((uint64_t) value * FONT_BUFFER_HEIGHT) / fontVirtualHeight;
+}
+
+static uint32_t scale_size(uint32_t value)
+{
+    uint32_t scaled = scale_y(value);
+    return scaled == 0 ? 1 : scaled;
+}
+
+static void apply_font_size(void)
+{
+    if (fontSize) {
+        FT_Set_Pixel_Sizes(ft_face, 0, scale_size(fontSize));
+    }
+}
 
 void Font_Init(void)
 {
@@ -122,6 +148,44 @@ void Font_Clear(void)
     GX2RUnlockSurfaceEx(&fontTexture.surface, 0, GX2R_RESOURCE_BIND_NONE);
 }
 
+void Font_FillRect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    x = scale_x(x);
+    y = scale_y(y);
+    width = scale_x(width);
+    height = scale_y(height);
+
+    if (x >= FONT_BUFFER_WIDTH || y >= FONT_BUFFER_HEIGHT) {
+        return;
+    }
+
+    uint32_t x_max = width > FONT_BUFFER_WIDTH - x ? FONT_BUFFER_WIDTH : x + width;
+    uint32_t y_max = height > FONT_BUFFER_HEIGHT - y ? FONT_BUFFER_HEIGHT : y + height;
+
+    uint8_t* pixels = (uint8_t*) GX2RLockSurfaceEx(&fontTexture.surface, 0, GX2R_RESOURCE_BIND_NONE);
+    for (uint32_t j = y; j < y_max; j++) {
+        for (uint32_t i = x; i < x_max; i++) {
+            uint32_t offset = (i + j * fontTexture.surface.pitch) * 4;
+            pixels[offset    ] = r;
+            pixels[offset + 1] = g;
+            pixels[offset + 2] = b;
+            pixels[offset + 3] = a;
+        }
+    }
+    GX2RUnlockSurfaceEx(&fontTexture.surface, 0, GX2R_RESOURCE_BIND_NONE);
+}
+
+void Font_SetVirtualSize(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0) {
+        return;
+    }
+
+    fontVirtualWidth = width;
+    fontVirtualHeight = height;
+    apply_font_size();
+}
+
 static void draw_freetype_bitmap(FT_Bitmap *bitmap, FT_Int x, FT_Int y, uint8_t* dst_buffer) {
     FT_Int i, j, p, q;
     FT_Int x_max = x + bitmap->width;
@@ -133,12 +197,39 @@ static void draw_freetype_bitmap(FT_Bitmap *bitmap, FT_Int x, FT_Int y, uint8_t*
                 continue;
             }
 
-            float opacity = bitmap->buffer[q * bitmap->pitch + p] / 255.0f;
+            uint32_t coverage = bitmap->buffer[q * bitmap->pitch + p];
+            if (coverage == 0) {
+                continue;
+            }
+
             uint32_t offset = (i + j * fontTexture.surface.pitch) * 4;
-            dst_buffer[offset    ] = font_r;
-            dst_buffer[offset + 1] = font_g;
-            dst_buffer[offset + 2] = font_b;
-            dst_buffer[offset + 3] = font_a * opacity;
+            uint32_t src_a = (font_a * coverage) / 255;
+            if (src_a == 0) {
+                continue;
+            }
+
+            uint32_t dst_a = dst_buffer[offset + 3];
+            uint32_t out_a = src_a + (dst_a * (255 - src_a)) / 255;
+
+            if (out_a == 0) {
+                dst_buffer[offset    ] = 0;
+                dst_buffer[offset + 1] = 0;
+                dst_buffer[offset + 2] = 0;
+                dst_buffer[offset + 3] = 0;
+                continue;
+            }
+
+            uint32_t src_r = font_r * src_a;
+            uint32_t src_g = font_g * src_a;
+            uint32_t src_b = font_b * src_a;
+            uint32_t dst_r = dst_buffer[offset    ] * dst_a;
+            uint32_t dst_g = dst_buffer[offset + 1] * dst_a;
+            uint32_t dst_b = dst_buffer[offset + 2] * dst_a;
+
+            dst_buffer[offset    ] = (src_r + (dst_r * (255 - src_a)) / 255) / out_a;
+            dst_buffer[offset + 1] = (src_g + (dst_g * (255 - src_a)) / 255) / out_a;
+            dst_buffer[offset + 2] = (src_b + (dst_b * (255 - src_a)) / 255) / out_a;
+            dst_buffer[offset + 3] = out_a;
         }
     }
 }
@@ -146,7 +237,8 @@ static void draw_freetype_bitmap(FT_Bitmap *bitmap, FT_Int x, FT_Int y, uint8_t*
 void Font_Printw(uint32_t x, uint32_t y, const wchar_t* string)
 {
     FT_GlyphSlot slot = ft_face->glyph;
-    FT_Vector pen = {(int) x, (int) y};
+    uint32_t scaledX = scale_x(x);
+    FT_Vector pen = {(int) scaledX, (int) scale_y(y)};
     uint8_t* pixels = (uint8_t*) GX2RLockSurfaceEx(&fontTexture.surface, 0, GX2R_RESOURCE_BIND_NONE);
 
     for (; *string; string++) {
@@ -154,7 +246,7 @@ void Font_Printw(uint32_t x, uint32_t y, const wchar_t* string)
 
         if (charcode == '\n') {
             pen.y += ft_face->size->metrics.height >> 6;
-            pen.x = x;
+            pen.x = scaledX;
             continue;
         }
 
@@ -209,5 +301,6 @@ void Font_SetColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
 
 void Font_SetSize(uint32_t size)
 {
-    FT_Set_Pixel_Sizes(ft_face, 0, size);
+    fontSize = size;
+    apply_font_size();
 }

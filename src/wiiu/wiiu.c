@@ -28,37 +28,40 @@ static float* drcAttribs;
 static float tvScreenSize[2];
 static float drcScreenSize[2];
 
-uint32_t currentFrame;
+static uint32_t currentFrame;
 uint32_t nextFrame;
 static uint32_t skippedFrames;
+static uint32_t droppedFrames;
+static uint32_t decodedFps;
+static uint32_t displayedFps;
+static uint32_t skippedFps;
+static uint32_t droppedFps;
+static uint32_t lastDecodedFrames;
+static uint32_t lastDisplayedFrames;
+static uint32_t lastSkippedFrames;
+static uint32_t lastDroppedFrames;
+static uint64_t lastFrameStatsTime;
 
 static OSFastMutex queueMutex;
 static yuv_texture_t* queueMessages[MAX_QUEUEMESSAGES];
 static uint32_t queueWriteIndex;
 static uint32_t queueReadIndex;
 static uint32_t tvFilterMode = WIIU_STREAM_FILTER_POINT;
-static uint32_t drcFilterMode = WIIU_STREAM_FILTER_POINT;
-static uint32_t appliedTvFilterMode = WIIU_STREAM_FILTER_POINT;
-static uint32_t appliedDrcFilterMode = WIIU_STREAM_FILTER_POINT;
+static uint32_t drcFilterMode = WIIU_STREAM_FILTER_LINEAR;
 static bool tvFilterDirty;
 static bool drcFilterDirty;
+
+static void* get_frame(void);
 
 static uint32_t gx2_filter_mode(uint32_t filterMode)
 {
   switch (filterMode) {
     case WIIU_STREAM_FILTER_LINEAR:
       return GX2_TEX_XY_FILTER_MODE_LINEAR;
-    case WIIU_STREAM_FILTER_BICUBIC:
-      return GX2_TEX_XY_FILTER_MODE_BICUBIC;
     case WIIU_STREAM_FILTER_POINT:
     default:
       return GX2_TEX_XY_FILTER_MODE_POINT;
   }
-}
-
-static void init_sampler(GX2Sampler* sampler, uint32_t filterMode)
-{
-  GX2InitSampler(sampler, GX2_TEX_CLAMP_MODE_WRAP, gx2_filter_mode(filterMode));
 }
 
 uint32_t wiiu_stream_get_tv_filter_mode(void)
@@ -83,7 +86,7 @@ uint32_t wiiu_stream_get_drc_filter_mode(void)
 
 void wiiu_stream_set_drc_filter_mode(uint32_t mode)
 {
-  if (mode > WIIU_STREAM_FILTER_BICUBIC) {
+  if (mode > WIIU_STREAM_FILTER_LINEAR) {
     return;
   }
 
@@ -95,15 +98,13 @@ static void apply_sampler_updates(void)
 {
   if (tvFilterDirty) {
     if (tvFilterMode != WIIU_STREAM_TV_OFF) {
-      init_sampler(&tvScreenSamp, tvFilterMode);
+      GX2InitSampler(&tvScreenSamp, GX2_TEX_CLAMP_MODE_WRAP, gx2_filter_mode(tvFilterMode));
     }
-    appliedTvFilterMode = tvFilterMode;
     tvFilterDirty = false;
   }
 
   if (drcFilterDirty) {
-    init_sampler(&drcScreenSamp, drcFilterMode);
-    appliedDrcFilterMode = drcFilterMode;
+    GX2InitSampler(&drcScreenSamp, GX2_TEX_CLAMP_MODE_WRAP, gx2_filter_mode(drcFilterMode));
     drcFilterDirty = false;
   }
 }
@@ -116,10 +117,49 @@ static uint32_t get_queue_depth(void)
   return elements_in;
 }
 
+static void update_frame_rates(uint32_t displayedFrames)
+{
+  uint64_t now = LiGetMillis();
+  if (lastFrameStatsTime == 0) {
+    lastFrameStatsTime = now;
+    lastDecodedFrames = nextFrame;
+    lastDisplayedFrames = displayedFrames;
+    lastSkippedFrames = skippedFrames;
+    lastDroppedFrames = droppedFrames;
+    return;
+  }
+
+  uint64_t elapsed = now - lastFrameStatsTime;
+  if (elapsed < 1000) {
+    return;
+  }
+
+  decodedFps = ((nextFrame - lastDecodedFrames) * 1000) / elapsed;
+  displayedFps = ((displayedFrames - lastDisplayedFrames) * 1000) / elapsed;
+  skippedFps = ((skippedFrames - lastSkippedFrames) * 1000) / elapsed;
+  droppedFps = ((droppedFrames - lastDroppedFrames) * 1000) / elapsed;
+
+  lastDecodedFrames = nextFrame;
+  lastDisplayedFrames = displayedFrames;
+  lastSkippedFrames = skippedFrames;
+  lastDroppedFrames = droppedFrames;
+  lastFrameStatsTime = now;
+}
+
 void wiiu_stream_init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate)
 {
   currentFrame = nextFrame = 0;
   skippedFrames = 0;
+  droppedFrames = 0;
+  decodedFps = 0;
+  displayedFps = 0;
+  skippedFps = 0;
+  droppedFps = 0;
+  lastDecodedFrames = 0;
+  lastDisplayedFrames = 0;
+  lastSkippedFrames = 0;
+  lastDroppedFrames = 0;
+  lastFrameStatsTime = 0;
 
   OSFastMutex_Init(&queueMutex, "");
   queueReadIndex = queueWriteIndex = 0;
@@ -137,8 +177,8 @@ void wiiu_stream_init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bi
     printf("cannot init shader\n");
   }
 
-  init_sampler(&tvScreenSamp, appliedTvFilterMode);
-  init_sampler(&drcScreenSamp, appliedDrcFilterMode);
+  GX2InitSampler(&tvScreenSamp, GX2_TEX_CLAMP_MODE_WRAP, gx2_filter_mode(tvFilterMode));
+  GX2InitSampler(&drcScreenSamp, GX2_TEX_CLAMP_MODE_WRAP, gx2_filter_mode(drcFilterMode));
 
   GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
   tvScreenSize[0] = 1.0f / (float) cb->surface.width;
@@ -185,12 +225,18 @@ void wiiu_stream_draw(void)
 {
   yuv_texture_t* tex = get_frame();
   if (tex) {
-    if (++currentFrame <= nextFrame - NUM_BUFFERS) {
+    currentFrame++;
+    uint32_t queuedOrRenderedFrames = nextFrame >= droppedFrames ? nextFrame - droppedFrames : 0;
+    if (queuedOrRenderedFrames >= NUM_BUFFERS && currentFrame <= queuedOrRenderedFrames - NUM_BUFFERS) {
       skippedFrames++;
       // display thread is behind decoder, skip frame
     }
     else {
-      Overlay_SetFrameStats(nextFrame, currentFrame - skippedFrames, skippedFrames, get_queue_depth());
+      uint32_t displayedFrames = currentFrame - skippedFrames;
+      update_frame_rates(displayedFrames);
+      Overlay_SetFrameStats(nextFrame, displayedFrames, skippedFrames, droppedFrames,
+                            decodedFps, displayedFps, skippedFps, droppedFps,
+                            get_queue_depth());
       Overlay_Prepare();
       apply_sampler_updates();
 
@@ -251,7 +297,7 @@ void wiiu_stream_fini(void)
   WHBGfxFreeShaderGroup(&shaderGroup);
 }
 
-void* get_frame(void)
+static void* get_frame(void)
 {
   OSFastMutex_Lock(&queueMutex);
 
@@ -274,6 +320,7 @@ void add_frame(yuv_texture_t* msg)
 
   uint32_t elements_in = queueWriteIndex - queueReadIndex;
   if (elements_in == MAX_QUEUEMESSAGES) {
+    droppedFrames++;
     OSFastMutex_Unlock(&queueMutex);
     return; // framequeue is full
   }

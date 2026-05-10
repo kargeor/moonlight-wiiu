@@ -17,6 +17,7 @@
 static int running = 0;
 static int fromHBL = 0;
 static int homeEnabled = 1;
+static int exitRequested = 0;
 
 static uint32_t procSaveCallback(void* context)
 {
@@ -80,11 +81,21 @@ int wiiu_proc_running(void)
         ProcUIDrawDoneRelease();
     }
 
+    if (exitRequested && state != STATE_STREAMING && state != STATE_STOP_STREAM) {
+        exitRequested = 0;
+        wiiu_proc_stop_running();
+    }
+
     if (!running) {
         ProcUIShutdown();
     }
 
     return running;
+}
+
+void wiiu_proc_request_exit(void)
+{
+    exitRequested = 1;
 }
 
 void wiiu_proc_stop_running(void)
